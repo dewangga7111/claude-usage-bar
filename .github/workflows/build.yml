@@ -1,0 +1,36 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --release
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: claude-usage-bar-windows
+          path: target/release/claude-usage-bar.exe
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - run: cargo test --release
+      - run: cargo build --release --target aarch64-apple-darwin
+      - run: cargo build --release --target x86_64-apple-darwin
+      - name: Universal binary
+        run: |
+          lipo -create -output claude-usage-bar \
+            target/aarch64-apple-darwin/release/claude-usage-bar \
+            target/x86_64-apple-darwin/release/claude-usage-bar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: claude-usage-bar-macos
+          path: claude-usage-bar
