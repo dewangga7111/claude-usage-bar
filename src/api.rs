@@ -145,7 +145,7 @@ impl fmt::Display for FetchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoCredentials => write!(f, "Not signed in. Log in with Claude Code first."),
-            Self::Expired => write!(f, "Login expired. Open Claude Code to refresh it."),
+            Self::Expired => write!(f, "Login expired and Claude Code could not refresh it."),
             Self::Unauthorized => write!(f, "Not authorized. Log in again with Claude Code."),
             Self::RateLimited => write!(f, "Rate limited. Retrying in a few minutes."),
             Self::Http(status) => write!(f, "Server returned HTTP {status}."),
@@ -227,6 +227,61 @@ pub fn fetch() -> Result<Fetched, FetchError> {
     Ok(Fetched { usage, plan: creds.plan })
 }
 
+/// Between attempts to refresh the login through Claude Code, in seconds.
+const LOGIN_REFRESH_COOLDOWN: i64 = 600;
+const LOGIN_REFRESH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The Claude Code executable: `PATH` first, then the native installer's and Homebrew's
+/// locations (a LaunchAgent or a login-started app may run with a minimal `PATH`).
+fn claude_exe() -> Option<PathBuf> {
+    let name = if cfg!(windows) { "claude.exe" } else { "claude" };
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
+    let mut dirs: Vec<PathBuf> =
+        std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    dirs.extend(home.map(|h| h.join(".local").join("bin")));
+    if cfg!(target_os = "macos") {
+        dirs.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
+    }
+    dirs.into_iter().map(|d| d.join(name)).find(|p| p.is_file())
+}
+
+/// Lets Claude Code refresh an expired token: any command that talks to claude.ai refreshes it
+/// and writes the new one back. `claude mcp list` does that without using inference quota.
+/// Refreshing here instead would rotate the refresh token behind Claude Code's back.
+fn refresh_login() -> bool {
+    let Some(exe) = claude_exe() else { return false };
+    let mut command = std::process::Command::new(exe);
+    command
+        .args(["mcp", "list"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(home) = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }) {
+        command.current_dir(home);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let Ok(mut child) = command.spawn() else { return false };
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if started.elapsed() < LOGIN_REFRESH_TIMEOUT => {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct Snapshot {
     pub usage: Option<Usage>,
@@ -246,8 +301,17 @@ pub fn snapshot() -> Snapshot {
 pub fn spawn_worker(poll: Duration, notify: fn()) -> Sender<()> {
     let (tx, rx) = mpsc::channel::<()>();
     std::thread::spawn(move || {
+        let mut last_login_refresh: Option<i64> = None;
         loop {
-            let result = fetch();
+            let mut result = fetch();
+            if matches!(result, Err(FetchError::Expired | FetchError::Unauthorized))
+                && last_login_refresh.is_none_or(|t| now_unix() - t >= LOGIN_REFRESH_COOLDOWN)
+            {
+                last_login_refresh = Some(now_unix());
+                if refresh_login() {
+                    result = fetch();
+                }
+            }
             let wait = {
                 let mut snap = SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner());
                 match result {
